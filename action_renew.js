@@ -1383,32 +1383,130 @@ function detectCaptchaRequired(text) {
     return null;
 }
 
+const ALTCHA_HOST_SELECTOR = 'altcha-widget, [data-altcha], .altcha';
+const MODAL_CHECKBOX_SELECTOR = 'input[type="checkbox"], [role="checkbox"]';
+
+function isBoxWithin(parentBox, childBox, padding = 30) {
+    if (!parentBox || !childBox) return false;
+    return childBox.x >= parentBox.x - padding
+        && childBox.x <= parentBox.x + parentBox.width + padding
+        && childBox.y >= parentBox.y - padding
+        && childBox.y <= parentBox.y + parentBox.height + padding;
+}
+
+/**
+ * ALTCHA is an asynchronously hydrated custom element. Playwright can pierce
+ * open Shadow DOM, but only after the component has rendered its checkbox.
+ * Keep polling the modal briefly and never use a page-level checkbox outside
+ * the modal as a fallback target.
+ */
+async function findVisibleModalCaptchaTarget(page, modal, timeoutMs = 8000) {
+    const startedAt = Date.now();
+    let visibleHost = null;
+
+    while (Date.now() - startedAt < timeoutMs) {
+        const modalBox = await modal.boundingBox().catch(() => null);
+        const scopedSelectors = [
+            'altcha-widget input[type="checkbox"]',
+            '[data-altcha] input[type="checkbox"]',
+            '.altcha input[type="checkbox"]',
+            MODAL_CHECKBOX_SELECTOR
+        ];
+
+        for (const selector of scopedSelectors) {
+            const candidates = modal.locator(selector);
+            const count = await candidates.count().catch(() => 0);
+            for (let index = 0; index < count; index++) {
+                const candidate = candidates.nth(index);
+                if (!(await candidate.isVisible().catch(() => false))) continue;
+                const box = await candidate.boundingBox().catch(() => null);
+                if (box && modalBox && !isBoxWithin(modalBox, box)) continue;
+                return { locator: candidate, kind: 'checkbox' };
+            }
+        }
+
+        // A custom element may be visible while its Shadow DOM is still empty.
+        // Remember it as a last-resort click target, but give the child time to render.
+        const hosts = modal.locator(ALTCHA_HOST_SELECTOR);
+        const hostCount = await hosts.count().catch(() => 0);
+        for (let index = 0; index < hostCount; index++) {
+            const host = hosts.nth(index);
+            if (await host.isVisible().catch(() => false)) {
+                visibleHost = host;
+                break;
+            }
+        }
+
+        const remaining = timeoutMs - (Date.now() - startedAt);
+        if (remaining <= 0) break;
+        await page.waitForTimeout(Math.min(250, remaining));
+    }
+
+    if (visibleHost) return { locator: visibleHost, kind: 'host' };
+
+    // ALTCHA may use an open Shadow DOM that is easier to discover globally
+    // than through a locator rooted at the dialog element.
+    const modalBox = await modal.boundingBox().catch(() => null);
+    const globalCandidates = page.locator(MODAL_CHECKBOX_SELECTOR);
+    const globalCount = await globalCandidates.count().catch(() => 0);
+    for (let index = 0; index < globalCount; index++) {
+        const candidate = globalCandidates.nth(index);
+        if (!(await candidate.isVisible().catch(() => false))) continue;
+        const box = await candidate.boundingBox().catch(() => null);
+        if (isBoxWithin(modalBox, box)) return { locator: candidate, kind: 'checkbox' };
+    }
+
+    return null;
+}
+
 /** 检测 ALTCHA checkbox 实际是否已勾选
  *  返回 true = 已勾选/已解决，false = 未勾选/未解决 */
 async function isAltchaCheckboxChecked(page, modal) {
-    // 策略 1: 查 modal 内是否有 checked 的 checkbox
+    // 策略 1: Playwright locator 会穿透 open Shadow DOM。
     try {
-        const checked = await modal.locator('input[type="checkbox"]:checked').count();
+        const checked = await modal.locator(
+            'input[type="checkbox"]:checked, [role="checkbox"][aria-checked="true"]'
+        ).count();
         if (checked > 0) return true;
     } catch (e) { }
 
-    // 策略 2: 查全页面 checked checkbox
+    // 策略 2: 直接遍历弹窗及其 open Shadow DOM，覆盖组件尚未暴露普通 locator 的情况。
     try {
-        const allChecked = await page.locator('input[type="checkbox"]:checked').all();
+        const checkedInShadow = await modal.evaluate((modalEl) => {
+            const walk = (root) => {
+                if (!root || !root.querySelectorAll) return false;
+                for (const el of root.querySelectorAll('*')) {
+                    if ((el.matches('input[type="checkbox"]') && el.checked)
+                        || (el.getAttribute('role') === 'checkbox'
+                            && el.getAttribute('aria-checked') === 'true')) {
+                        return true;
+                    }
+                    if (el.shadowRoot && walk(el.shadowRoot)) return true;
+                }
+                return false;
+            };
+            return walk(modalEl);
+        });
+        if (checkedInShadow) return true;
+    } catch (e) { }
+
+    // 策略 3: 查全页面 checked checkbox，并限制在当前 modal 范围内
+    try {
+        const allChecked = await page.locator(
+            'input[type="checkbox"]:checked, [role="checkbox"][aria-checked="true"]'
+        ).all();
         const modalBox = await modal.boundingBox();
         for (const cb of allChecked) {
             try {
                 const box = await cb.boundingBox();
-                if (box && modalBox &&
-                    box.x >= modalBox.x - 30 && box.x <= modalBox.x + modalBox.width + 30 &&
-                    box.y >= modalBox.y - 30 && box.y <= modalBox.y + modalBox.height + 30) {
+                if (isBoxWithin(modalBox, box)) {
                     return true;
                 }
             } catch (e) { }
         }
     } catch (e) { }
 
-    // 策略 3: 查 iframe 内
+    // 策略 4: 查 iframe 内
     try {
         const frames = page.frames();
         for (const frame of frames) {
@@ -1421,6 +1519,17 @@ async function isAltchaCheckboxChecked(page, modal) {
     } catch (e) { }
 
     return false;
+}
+
+async function getModalValidationMessage(modal) {
+    try {
+        const messages = await modal.locator(MODAL_CHECKBOX_SELECTOR).evaluateAll((elements) =>
+            elements.map((el) => el.validationMessage || '').filter(Boolean)
+        );
+        return messages[0] || null;
+    } catch (e) {
+        return null;
+    }
 }
 
 /** 检测续期成功文本 */
@@ -1495,8 +1604,26 @@ async function readExpiryDate(page) {
 // ============================================================
 //  尝试点击 ALTCHA / Turnstile checkbox（弹窗内）
 // ============================================================
-async function tryClickCaptchaCheckbox(page, modal) {
-    // 策略1: 利用 INJECTED_SCRIPT 注入的 __turnstile_data + CDP 点击
+async function tryClickCaptchaCheckbox(page, modal, { waitMs = 8000 } = {}) {
+    // 策略 1: 先等待并点击当前弹窗内的 ALTCHA checkbox（包含 open Shadow DOM）。
+    const modalTarget = await findVisibleModalCaptchaTarget(page, modal, waitMs);
+    if (modalTarget) {
+        try {
+            await modalTarget.locator.scrollIntoViewIfNeeded().catch(() => { });
+            await modalTarget.locator.click({ force: true });
+            if (modalTarget.kind === 'host') {
+                console.log('[Captcha] ALTCHA checkbox 未暴露，已发送宿主元素兜底点击。');
+            } else {
+                console.log('[Captcha] Playwright 点击 checkbox 成功。');
+            }
+            await page.waitForTimeout(2000);
+            return true;
+        } catch (e) {
+            console.log(`[Captcha] 弹窗内 ALTCHA 点击失败: ${e.message}`);
+        }
+    }
+
+    // 策略 2: 利用 INJECTED_SCRIPT 注入的 __turnstile_data + CDP 点击
     const cdpRes = await attemptTurnstileCdp(page);
     const clickedCdp = !!(cdpRes && (cdpRes.sent === true || cdpRes === true));
     if (clickedCdp) {
@@ -1505,17 +1632,16 @@ async function tryClickCaptchaCheckbox(page, modal) {
         return true;
     }
 
-    // 策略2: 在 modal 范围内查找可见的 checkbox 并点击
+    // 策略 3: 在 modal 范围内查找可见的 checkbox 并点击
     try {
         const modalBox = await modal.boundingBox();
-        const checkboxes = await page.locator('input[type="checkbox"]').all();
+        const checkboxes = await page.locator(MODAL_CHECKBOX_SELECTOR).all();
         for (const cb of checkboxes) {
             try {
                 const box = await cb.boundingBox();
                 if (!box || !modalBox) continue;
                 // 只点击 modal 范围内的 checkbox
-                if (box.x >= modalBox.x - 20 && box.x <= modalBox.x + modalBox.width + 20 &&
-                    box.y >= modalBox.y - 20 && box.y <= modalBox.y + modalBox.height + 20) {
+                if (isBoxWithin(modalBox, box, 20)) {
                     if (await cb.isVisible()) {
                         await cb.click({ force: true });
                         console.log('[Captcha] Playwright 点击 checkbox 成功。');
@@ -1527,7 +1653,7 @@ async function tryClickCaptchaCheckbox(page, modal) {
         }
     } catch (e) { }
 
-    // 策略3: 尝试在 iframe 中查找并点击 checkbox
+    // 策略 4: 尝试在 iframe 中查找并点击 checkbox
     try {
         const frames = page.frames();
         for (const frame of frames) {
@@ -2031,14 +2157,14 @@ async function runMain() {
                     // 识别弹窗验证类型：ALTCHA / CF Turnstile / 无，非 CF 时跳过
                     // 只用强特征，限定当前弹窗
                     const hasCfInModal = await modal.locator('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]').count().catch(() => 0) > 0;
-                    const hasAltchaInModal2 = /Protected by ALTCHA/i.test(modalText)
-                        || await modal.locator('altcha-widget, [data-altcha], .altcha').count().catch(() => 0) > 0;
-                    console.log(`[Renew阶段] 弹窗验证类型: ${hasAltchaInModal2 ? 'ALTCHA' : hasCfInModal ? 'CF Turnstile' : '无'}`);
+                    const hasAltchaInModal = /Protected by ALTCHA/i.test(modalText)
+                        || await modal.locator(ALTCHA_HOST_SELECTOR).count().catch(() => 0) > 0;
+                    console.log(`[Renew阶段] 弹窗验证类型: ${hasAltchaInModal ? 'ALTCHA' : hasCfInModal ? 'CF Turnstile' : '无'}`);
 
-                    if (hasCfInModal && !hasAltchaInModal2) {
+                    if (hasCfInModal && !hasAltchaInModal) {
                         const turnstileResult = await solveTurnstileIfPresent(page, "Renew阶段", 15, 6000);
                         console.log(`[Renew阶段] Turnstile 检测结果: ${turnstileResult ? '已处理' : '未检测到或无需点击'}`);
-                    } else if (hasAltchaInModal2) {
+                    } else if (hasAltchaInModal) {
                         console.log('[Renew阶段] ALTCHA 验证，由下方 ALTCHA 逻辑处理，跳过 CF Turnstile 检测。');
                     } else {
                         console.log('[Renew阶段] 未检测到验证码类型，跳过。');
@@ -2068,9 +2194,7 @@ async function runMain() {
                         break;
                     }
 
-                    // 【ALTCHA 前置检测】modal text 含 ALTCHA 关键词时，必须先完成 checkbox 才能点 confirm
-                    const hasAltchaInModal = /Protected by ALTCHA/i.test(modalText)
-                        || await modal.locator('altcha-widget, [data-altcha], .altcha').count().catch(() => 0) > 0;
+                    // 【ALTCHA 前置检测】等待异步组件，但不要因为 checkbox 尚未渲染就跳过后端确认。
                     if (hasAltchaInModal) {
                         console.log('[ALTCHA] Modal 检测到 ALTCHA/checkbox 验证，先完成验证再点 confirm。');
                         const cbCheckedBefore = await isAltchaCheckboxChecked(page, modal);
@@ -2085,23 +2209,11 @@ async function runMain() {
                                 const cbCheckedAfter = await isAltchaCheckboxChecked(page, modal);
                                 console.log(`[ALTCHA] checkbox checked after click: ${cbCheckedAfter}`);
                                 if (!cbCheckedAfter) {
-                                    console.log('[ALTCHA] 点击后 checkbox 仍未勾选，标记 captcha_required。');
-                                    runStatus = 'captcha_required';
-                                    blockMessage = 'ALTCHA checkbox click did not result in checked state';
-                                    renewSuccess = false;
-                                    const photoDir = await ensureScreenshotsDir();
-                                    await dumpDebugSnapshot(page, `captcha_required_${attempt}`);
-                                    break;
+                                    console.log('[ALTCHA] 点击后 checkbox 仍未勾选，继续提交 confirm，由服务端返回真实状态。');
                                 }
-                                console.log('[ALTCHA] ✅ Checkbox 已勾选，可以点击 confirm。');
+                                if (cbCheckedAfter) console.log('[ALTCHA] ✅ Checkbox 已勾选，可以点击 confirm。');
                             } else {
-                                console.log('[ALTCHA] 所有点击策略均失败，标记 captcha_required。');
-                                runStatus = 'captcha_required';
-                                blockMessage = 'ALTCHA checkbox could not be auto-clicked';
-                                renewSuccess = false;
-                                const photoDir = await ensureScreenshotsDir();
-                                await dumpDebugSnapshot(page, `captcha_required_${attempt}`);
-                                break;
+                                console.log('[ALTCHA] 暂未找到可点击 checkbox，继续提交 confirm，由服务端返回真实状态。');
                             }
                         } else {
                             console.log('[ALTCHA] checkbox 已经勾选，直接点击 confirm。');
@@ -2145,7 +2257,8 @@ async function runMain() {
                     }
 
                     // 检查 2: 验证码/checkbox 未完成
-                    const captchaIssue = detectCaptchaRequired(pageTextAfterClick);
+                    const captchaIssue = detectCaptchaRequired(`${pageTextAfterClick}\n${modalTextAfterClick}`)
+                        || await getModalValidationMessage(modal);
                     if (captchaIssue) {
                         console.log(`   >> ⚠️ 检测到验证码阻断: ${captchaIssue}`);
                         console.log('   >> 尝试自动点击 checkbox...');
@@ -2285,7 +2398,8 @@ async function runMain() {
 
                     // 检查 5: modal 仍开着，诊断原因
                     console.log('   >> 模态框仍开着，诊断阻断原因...');
-                    const blockingState = detectCaptchaRequired(pageTextAfterClick);
+                    const blockingState = detectCaptchaRequired(`${pageTextAfterClick}\n${modalTextAfterClick}`)
+                        || await getModalValidationMessage(modal);
                     if (blockingState) {
                         console.log(`   >> ⚠️ 已知阻断状态: ${blockingState}`);
                         runStatus = blockingState.includes('ALTCHA') || blockingState.includes('checkbox') ? 'captcha_required' : 'unknown_blocked';

@@ -3,5 +3,13 @@ login.json
 ChromeData_Katabump/
 .env
 *.log
+logs_*/
+config.json
+PROXY_URL.txt
+sing-box
+sing-box-*.tar.gz
+proxies.txt
+proxy-cooldown.json
+screenshots/
 .DS_Store
 photo/

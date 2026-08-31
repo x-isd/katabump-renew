@@ -31,7 +31,9 @@ jobs:
       run: npm ci
 
     - name: Syntax and unit checks
-      run: npm run check
+      run: |
+        npm run check
+        python3 -m py_compile proxy_handler.py
 
     - name: Load runtime dependencies
       run: node -e "require('axios'); require('playwright-extra'); require('puppeteer-extra-plugin-stealth')"
@@ -55,7 +57,7 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y xvfb netcat-openbsd
+        sudo apt-get install -y xvfb netcat-openbsd curl wget python3
         npm ci
         npx playwright install-deps chrome
 
@@ -67,10 +69,56 @@ jobs:
         restore-keys: |
           katabump-proxy-cooldown-
 
+    - name: Start multi-protocol proxy (sing-box)
+      env:
+        PROXY_URL: ${{ secrets.PROXY_URL }}
+      run: |
+        if [ -z "$PROXY_URL" ]; then
+          echo "PROXY_URL is empty; multi-protocol proxy disabled."
+          exit 0
+        fi
+
+        SINGBOX_VER="1.13.16"
+        echo "Downloading sing-box v${SINGBOX_VER}..."
+        wget -q "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
+        tar -xzf "sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
+        mv "sing-box-${SINGBOX_VER}-linux-amd64/sing-box" ./sing-box
+        chmod +x ./sing-box
+
+        echo "Generating sing-box config from PROXY_URL..."
+        python3 proxy_handler.py
+        nohup ./sing-box run -c config.json > singbox.log 2>&1 &
+        echo "PROXY_SERVER=http://127.0.0.1:8080" >> "$GITHUB_ENV"
+
+        proxy_ready=false
+        for i in $(seq 1 30); do
+          if curl -fsS --connect-timeout 5 --max-time 15 \
+              -x http://127.0.0.1:8080 https://api.ip.sb/ip \
+              -o /tmp/katabump-proxy-ip; then
+            proxy_ready=true
+            break
+          fi
+          sleep 2
+        done
+
+        if [ "$proxy_ready" != "true" ]; then
+          echo "❌ sing-box started but local proxy connectivity failed"
+          exit 1
+        fi
+        if ! pgrep -f "./sing-box" > /dev/null; then
+          echo "❌ sing-box process is not running"
+          exit 1
+        fi
+        echo "✅ Multi-protocol proxy is ready at http://127.0.0.1:8080"
+
     - name: Download proxy list
       env:
         WEBSHARE_PROXY_LIST_URL: ${{ secrets.WEBSHARE_PROXY_LIST_URL }}
       run: |
+        if [ -n "${PROXY_SERVER:-}" ]; then
+          echo "PROXY_URL mode is active; skipping Webshare proxy list."
+          exit 0
+        fi
         if [ -n "$WEBSHARE_PROXY_LIST_URL" ]; then
           echo "Downloading Webshare proxy list..."
           curl -fsSL \
@@ -87,7 +135,9 @@ jobs:
         fi
 
     - name: Syntax Check
-      run: npm run check
+      run: |
+        npm run check
+        python3 -m py_compile proxy_handler.py
 
     - name: Run proxy runner (with dynamic proxy coverage)
       env:
@@ -102,7 +152,9 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: screenshots
-        path: screenshots/
+        path: |
+          screenshots/
+          singbox.log
 
     - name: Save proxy cooldown cache
       if: always()

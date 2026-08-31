@@ -58,6 +58,7 @@ const CONFIG = {
     COOLDOWN_HOURS: PROXY_COOLDOWN_HOURS,
     PROXIES_FILE: path.join(process.cwd(), 'proxies.txt')
 };
+const FIXED_PROXY_URL = (process.env.PROXY_SERVER || '').trim();
 
 function getMaxProxyAttempts(validProxyCount, configuredLimit = CONFIG.MAX_PROXY_SWITCHES) {
     if (validProxyCount <= 0) return 0;
@@ -406,6 +407,47 @@ function buildHttpProxy(parsed) {
     return urlStr;
 }
 
+function parseFixedProxyUrl(value) {
+    const raw = (value || '').trim();
+    if (!raw) return null;
+
+    let parsedUrl;
+    try {
+        parsedUrl = new URL(raw);
+    } catch {
+        return null;
+    }
+
+    if (
+        parsedUrl.protocol !== 'http:' ||
+        !parsedUrl.hostname ||
+        parsedUrl.pathname !== '/' ||
+        parsedUrl.search ||
+        parsedUrl.hash
+    ) {
+        return null;
+    }
+
+    let username = '';
+    let password = '';
+    try {
+        username = parsedUrl.username ? decodeURIComponent(parsedUrl.username) : '';
+        password = parsedUrl.password ? decodeURIComponent(parsedUrl.password) : '';
+    } catch {
+        return null;
+    }
+    if (Boolean(username) !== Boolean(password)) return null;
+
+    return {
+        valid: true,
+        ip: parsedUrl.hostname.toLowerCase(),
+        port: parsedUrl.port || '80',
+        username,
+        password,
+        fixed: true
+    };
+}
+
 function proxyKey(parsed) {
     return `${parsed.ip}:${parsed.port}`;
 }
@@ -588,6 +630,30 @@ async function runProxyWorkflow(attempts) {
     console.log(`[proxy-runner] 代理冷却 ${CONFIG.COOLDOWN_HOURS}h`);
     console.log(`[proxy-runner] 退出码映射: SUCCESS=0 FATAL=1 PROXY_RETRY=42 NOT_READY=3 ALREADY_RENEWED=4 LOGIN_FAILED=5 NO_PROXY_AVAILABLE=6 RENEW_CAPTCHA_FAILED=43`);
 
+    // PROXY_SERVER 由 sing-box 工作流步骤写入，代表本地 HTTP 入站。
+    // 固定代理模式下由 sing-box/urltest 负责节点选择，不能再被 proxies.txt 覆盖。
+    if (FIXED_PROXY_URL) {
+        const fixedProxy = parseFixedProxyUrl(FIXED_PROXY_URL);
+        if (!fixedProxy) {
+            return finalizeWorkflow(EXIT_CODE.FATAL, {
+                status: 'error',
+                message: 'Invalid PROXY_SERVER; expected an http://host:port URL',
+                accounts: []
+            }, attempts, 1);
+        }
+
+        console.log(`[proxy-runner] 固定本地代理模式: ${safeProxyId(fixedProxy)}`);
+        const result = await runActionRenew(fixedProxy, 1);
+        const attemptRecord = makeAttemptRecord(1, fixedProxy, result);
+        attempts.push(attemptRecord);
+        return finalizeWorkflow(
+            normalizeFinalCode(result.code),
+            result.actionResult || attemptRecord,
+            attempts,
+            1
+        );
+    }
+
     const proxyResult = loadProxies();
     const proxies = proxyResult.valid;
     let cooldowns = loadCooldowns();
@@ -750,6 +816,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename
 
 module.exports = {
     parseProxyLine,
+    parseFixedProxyUrl,
     buildHttpProxy,
     buildChildEnv,
     maskProxyUrl,

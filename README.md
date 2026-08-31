@@ -20,6 +20,8 @@
 - `USERS_JSON` Secret 配置账号
 - 可选 Telegram 通知
 - 自动上传运行截图 Artifacts
+- `PROXY_URL` Secret 支持 VLESS、VMess、Hy2、TUIC、Trojan、AnyTLS、SOCKS5 等协议
+- sing-box 将多协议节点转换为本地 HTTP 代理，Playwright 使用原生代理启动
 - Webshare 代理列表自动下载
 - 从 Webshare 10 个代理中随机选择一个出口
 - 自动写入 `HTTP_PROXY` / `HTTPS_PROXY`
@@ -65,7 +67,24 @@ Settings → Secrets and variables → Actions → New repository secret
 
 ---
 
-## 🌐 Webshare 代理配置（推荐）
+## 🌐 多协议代理配置（推荐）
+
+如果你有 VLESS、VMess、Hy2、TUIC、Trojan、AnyTLS 或 SOCKS5 节点，添加名为
+`PROXY_URL` 的 GitHub Secret，填入完整 URI。Actions 会先用 sing-box 启动本地
+`http://127.0.0.1:8080`，再让 Playwright 浏览器通过这个入口访问 KataBump。
+
+示例格式：
+
+```text
+vless://UUID@example.com:443?security=reality&type=tcp&sni=example.com&pbk=PUBLIC_KEY&sid=SHORT_ID
+vmess://BASE64_ENCODED_JSON
+hy2://PASSWORD@example.com:443?sni=example.com
+```
+
+`PROXY_URL` 模式优先于 `WEBSHARE_PROXY_LIST_URL`。工作流会先验证本地 HTTP 代理
+确实能访问外网，代理不可用时直接停止，不会悄悄切换成直连。
+
+## 🌐 Webshare 代理配置（兼容模式）
 
 地址：https://www.webshare.io/?referral_code=sfojw2m7nss0
 

@@ -17,6 +17,7 @@ function safeRequire() {
 function tests() {
     const mod = safeRequire();
     assert.strictEqual(typeof mod.parseProxyLine, 'function');
+    assert.strictEqual(typeof mod.parseFixedProxyUrl, 'function');
     assert.strictEqual(typeof mod.buildHttpProxy, 'function');
     assert.strictEqual(typeof mod.maskProxyUrl, 'function');
     assert.strictEqual(typeof mod.emitGithubMask, 'function');
@@ -29,6 +30,28 @@ function tests() {
     assert.strictEqual(typeof mod.isRealProxyNetworkFailure, 'function');
     assert.strictEqual(typeof mod.proxyKey, 'function');
     assert.strictEqual(typeof mod.safeProxyId, 'function');
+
+    const fixedProxy = mod.parseFixedProxyUrl('http://127.0.0.1:8080');
+    assert.deepStrictEqual(fixedProxy, {
+        valid: true,
+        ip: '127.0.0.1',
+        port: '8080',
+        username: '',
+        password: '',
+        fixed: true
+    });
+    assert.strictEqual(mod.parseFixedProxyUrl('socks5://127.0.0.1:1080'), null);
+    assert.strictEqual(mod.parseFixedProxyUrl('http://127.0.0.1:8080/path'), null);
+    const fixedEnv = mod.buildChildEnv(fixedProxy, {
+        HTTP_PROXY: 'http://old-proxy',
+        HTTPS_PROXY: 'http://old-proxy',
+        http_proxy: 'http://old-proxy',
+        https_proxy: 'http://old-proxy'
+    });
+    assert.strictEqual(fixedEnv.HTTP_PROXY, 'http://127.0.0.1:8080');
+    assert.strictEqual(fixedEnv.HTTPS_PROXY, 'http://127.0.0.1:8080');
+    assert.strictEqual(fixedEnv.http_proxy, 'http://127.0.0.1:8080');
+    assert.strictEqual(fixedEnv.https_proxy, 'http://127.0.0.1:8080');
 
     const samples = [
         {

@@ -1,4 +1,5 @@
 const assert = require('assert');
+const path = require('path');
 const { EventEmitter } = require('events');
 const {
     buildBrowserLaunchOptions,
@@ -142,8 +143,9 @@ async function tests() {
         screenshotName: 'account.png',
         logger: () => {}
     });
-    assert.strictEqual(successfulCleanup.screenshotPath, '/tmp/screenshots/account.png');
-    assert.strictEqual(screenshotPath, '/tmp/screenshots/account.png');
+    const expectedScreenshotPath = path.resolve('/tmp/screenshots', 'account.png');
+    assert.strictEqual(successfulCleanup.screenshotPath, expectedScreenshotPath);
+    assert.strictEqual(screenshotPath, expectedScreenshotPath);
 
     let closeAfterScreenshot = 0;
     let contextCloseAfterPageError = 0;

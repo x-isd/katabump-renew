@@ -161,10 +161,15 @@ def parse_vless(parsed, params):
 
 def parse_vmess(url_str):
     encoded = url_str[len("vmess://"):]
+    # 客户端导出的 vmess 链接常带 #备注（节点名）甚至 ?参数，
+    # 必须先剥掉，否则 base64 解码直接崩（之前只用 vless 没暴露这个问题）。
+    encoded = encoded.split("#", 1)[0].split("?", 1)[0].strip()
+    # 兼容 URL-safe base64（-/_ 替代 +/）
+    encoded = encoded.replace("-", "+").replace("_", "/")
     # Fix base64 padding
-    pad = 4 - len(encoded) % 4
-    if pad != 4:
-        encoded += "=" * pad
+    pad = len(encoded) % 4
+    if pad:
+        encoded += "=" * (4 - pad)
     decoded = base64.b64decode(encoded).decode("utf-8")
     cfg = json.loads(decoded)
 

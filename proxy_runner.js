@@ -642,15 +642,36 @@ async function runProxyWorkflow(attempts) {
             }, attempts, 1);
         }
 
-        console.log(`[proxy-runner] 固定本地代理模式: ${safeProxyId(fixedProxy)}`);
-        const result = await runActionRenew(fixedProxy, 1);
-        const attemptRecord = makeAttemptRecord(1, fixedProxy, result);
-        attempts.push(attemptRecord);
+        // 固定代理只有一条，PROXY_RETRY(42) 无法换代理，改为带间隔重试，
+        // 熬过代理节点的瞬断；全部失败才报 FATAL，避免 Actions 显示晦涩的 42。
+        const fixedMaxRetries = parsePositiveNumber(process.env.FIXED_PROXY_MAX_RETRIES, 3);
+        const fixedRetryDelaySec = parsePositiveNumber(process.env.FIXED_PROXY_RETRY_DELAY_SECONDS, 30);
+
+        console.log(`[proxy-runner] 固定本地代理模式: ${safeProxyId(fixedProxy)}（失败重试 ${fixedMaxRetries} 次，间隔 ${fixedRetryDelaySec}s）`);
+        let result = null;
+        for (let retry = 1; retry <= fixedMaxRetries; retry++) {
+            result = await runActionRenew(fixedProxy, retry);
+            const attemptRecord = makeAttemptRecord(retry, fixedProxy, result);
+            attempts.push(attemptRecord);
+            if (result.code !== EXIT_CODE.PROXY_RETRY) break;
+            if (retry < fixedMaxRetries) {
+                console.log(`[proxy-runner] 固定代理第 ${retry} 次返回 PROXY_RETRY，${fixedRetryDelaySec}s 后重试`);
+                await new Promise((resolve) => setTimeout(resolve, fixedRetryDelaySec * 1000));
+            }
+        }
+        if (result.code === EXIT_CODE.PROXY_RETRY) {
+            console.error('[proxy-runner] 固定代理多次重试仍不可用，请检查 PROXY_URL 节点是否存活、IP 是否被目标站封禁');
+            return finalizeWorkflow(EXIT_CODE.FATAL, {
+                status: 'proxy_unavailable',
+                message: 'Fixed proxy (sing-box) unreachable after retries; check PROXY_URL node health or IP ban',
+                accounts: []
+            }, attempts, fixedMaxRetries);
+        }
         return finalizeWorkflow(
             normalizeFinalCode(result.code),
-            result.actionResult || attemptRecord,
+            result.actionResult || attempts[attempts.length - 1],
             attempts,
-            1
+            fixedMaxRetries
         );
     }
 
